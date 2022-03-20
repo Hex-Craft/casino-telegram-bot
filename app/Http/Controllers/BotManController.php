@@ -2,6 +2,8 @@
 
 namespace App\Http\Controllers;
 
+use App\Exceptions\SlotsException;
+use App\Slots;
 use App\User;
 use BotMan\BotMan\BotMan;
 use BotMan\BotMan\BotManFactory;
@@ -9,23 +11,20 @@ use BotMan\BotMan\Drivers\DriverManager;
 use BotMan\Drivers\Telegram\TelegramDriver;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\Log;
+use Throwable;
 
 class BotManController extends Controller
 {
     public BotMan $botman;
 
+    /**
+     * @return void
+     */
     public function handle()
     {
-        $config = [
-            'telegram' => [
-                'token' => env('TELEGRAM_BOT_TOKEN'),
-            ],
-        ];
-
         DriverManager::loadDriver(TelegramDriver::class);
 
-        $this->botman = BotManFactory::create($config);
+        $this->botman = BotManFactory::create(config('slots.config'));
 
         $this->botman->hears('/start', function ($bot) {
             $this->showMenu($bot);
@@ -60,24 +59,24 @@ class BotManController extends Controller
         });
 
         $this->botman->hears('/freespin', function ($bot) {
-            $this->spin($bot, false, true);
-        });
-
-        $this->botman->hears('/debugspin', function ($bot) {
-            $this->spin($bot, true, true);
+            Slots::freeSpin($bot);
         });
 
         $this->botman->hears('/spin', function ($bot) {
-            $this->spin($bot);
+            Slots::spin($bot);
         });
 
         $this->botman->hears('/spin {bet}', function ($bot, $bet) {
-            $this->spin($bot, false, false, $bet);
+            Slots::spin($bot, $bet);
         });
 
         $this->botman->listen();
     }
 
+    /**
+     * @param BotMan $bot
+     * @return void
+     */
     public function showMenu(BotMan $bot): void
     {
         $message = '/menu - ' . __('slots.commands.menu') .  ";\n";
@@ -96,9 +95,6 @@ class BotManController extends Controller
 
     public function connect(BotMan $bot, string $username, string $password): void
     {
-        $telegramUser = $bot->getUser();
-        $telegramId = $telegramUser->getId();
-
         $user = User::query()->where('name', $username);
 
         if (!$user->exists()) {
@@ -108,158 +104,72 @@ class BotManController extends Controller
 
         if (Hash::check($password, $user->first()->password)) {
             $bot->reply(__('slots.account.connected'));
-            $user->update(['telegram_id' => $telegramId]);
+            $user->update(['telegram_id' => $bot->getUser()->getId()]);
             return;
         }
 
         $bot->reply(__('slots.invalid_password'));
     }
 
-    public function getUser(BotMan $bot): Builder
+    /**
+     * @throws Throwable
+     */
+    public static function getUser(BotMan $bot): Builder
     {
-        $telegramUser = $bot->getUser();
-        $telegramId = $telegramUser->getId();
-
-        return User::query()->where('telegram_id', $telegramId);
-    }
-
-    public function disconnect(BotMan $bot)
-    {
-        $user = $this->getUser($bot);
+        $user = User::query()->where('telegram_id', $bot->getUser()->getId());
 
         if (!$user->exists()) {
-            $bot->reply(__('slots.account.not_connected'));
-            return;
+            throw new SlotsException($bot, __('slots.account.not_connected'));
         }
 
-        $user->update(['telegram_id' => null]);
+        return $user;
+    }
+
+    /**
+     * @param BotMan $bot
+     * @return void
+     * @throws Throwable
+     */
+    public function disconnect(BotMan $bot)
+    {
+        $this->getUser($bot)->update(['telegram_id' => null]);
         $bot->reply(__('slots.account.disconnected'));
     }
 
+    /**
+     * @param BotMan $bot
+     * @return void
+     * @throws Throwable
+     */
     public function check(BotMan $bot)
     {
-        $user = $this->getUser($bot);
-
-        if (!$user->exists()) {
-            $bot->reply(__('slots.account.not_connected'));
-            return;
-        }
-
-        $bot->reply(__('slots.account.check_ok') . $user->first()->name);
+        $bot->reply(__('slots.account.check_ok') . $this->getUser($bot)->first()->name);
     }
 
+    /**
+     * @param BotMan $bot
+     * @return void
+     * @throws Throwable
+     */
     public function balance(BotMan $bot)
     {
-        $user = $this->getUser($bot);
-
-        if (!$user->exists()) {
-            $bot->reply(__('slots.account.not_connected'));
-            return;
-        }
-
-        $bot->reply('Баланс на сайте: ' . $user->first()->user_balance);
+        $bot->reply('Баланс на сайте: ' . $this->getUser($bot)->first()->user_balance);
     }
 
+    /**
+     * @param BotMan $bot
+     * @param string $username
+     * @return void
+     * @throws Throwable
+     */
     public function getUserBalance(BotMan $bot, string $username)
     {
         $user = User::query()->where('name', $username);
 
         if (!$user->exists()) {
-            $bot->reply(__('slots.account.not_found'));
-            return;
+            throw new SlotsException($bot, __('slots.account.not_found'));
         }
 
         $bot->reply(__('slots.user_balance') . $user->first()->user_balance);
-    }
-
-    public function spin(BotMan $bot, $debug = false, $free = false, $bet = null)
-    {
-        if (!$free) {
-            $user = $this->getUser($bot);
-
-            if (!$user->exists()) {
-                $bot->reply(__('slots.account.not_connected'));
-                return;
-            }
-
-            if (is_null($bet)) {
-                $bet = config('slots.basic_bet');
-            } else {
-                $balance = $user->first()->user_balance;
-
-                if ($bet > $balance) {
-                    $bot->reply(__('slots.not_enough') . __('slots.currency') . '.');
-                    return;
-                }
-
-                if ($bet < config('slots.basic_bet')) {
-                    $bot->reply(config('slots.min_bet') . ' - ' . config('slots.basic_bet') . __('slots.currency') . '.');
-                    return;
-                }
-            }
-
-            $user->decrement('user_balance', $bet);
-            $sitename = $user->first()->name;
-            Log::info('User ' . $sitename . ' initiated slot spin with bet ' . $bet);
-        } else {
-            $user = $bot->getUser();
-            $username = $user->getUsername();
-            Log::info('User ' . $username . ' initiated free spin');
-        }
-
-        $first = rand(1, 5);
-        $second = rand(1, 5);
-        $third = rand(1, 5);
-
-        $message = $this->convertToEmoji($first);
-        $message .= $this->convertToEmoji($second);
-        $message .= $this->convertToEmoji($third);
-
-        if ($debug) {
-            $message .= $first . $second . $third;
-        }
-
-        if ($free) {
-            if ($first === $second && $second === $third) {
-                $message .= __('slots.response.triple');
-            } else if ($first === $second || $second === $third) {
-                $message .= __('slots.response.double');
-            } else {
-                $message .= __('slots.response.fail');
-            }
-        } else {
-            if ($first === $second && $second === $third) {
-                $prize = $bet * config('slots.multipliers.triple');
-            } else if ($first === $second || $second === $third) {
-                $prize = $bet * config('slots.multipliers.double');
-            } else {
-                $message .= __('slots.response.fail');
-                $bot->reply($message);
-                return;
-            }
-
-            $message .= __('slots.you_won') . $prize . ' ' . __('slots.currency') . '!';
-            $user->increment('user_balance', $prize);
-            Log::info('User ' . $sitename . ' won ' . $prize);
-        }
-        $bot->reply($message);
-    }
-
-    public function convertToEmoji(int $number): string
-    {
-        switch ($number) {
-            case 1:
-                return config('slots.emoji.1');
-            case 2:
-                return config('slots.emoji.2');
-            case 3:
-                return config('slots.emoji.3');
-            case 4:
-                return config('slots.emoji.4');
-            case 5:
-                return config('slots.emoji.5');
-            default:
-                return config('slots.emoji.default');
-        }
     }
 }

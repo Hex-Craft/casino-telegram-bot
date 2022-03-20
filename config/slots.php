@@ -14,4 +14,9 @@ return [
         '5' => '🍓',
         'default' => '❔',
     ],
+    'config' => [
+        'telegram' => [
+            'token' => env('TELEGRAM_BOT_TOKEN'),
+        ],
+    ],
 ];
